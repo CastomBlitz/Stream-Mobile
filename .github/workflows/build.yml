@@ -1,0 +1,623 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p /tmp/proj
+          cd /tmp/proj
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
+          }
+          rootProject.name = "ScreenStream"
+          include(":app")
+          EOF_0
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_2
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.screenstream"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.screenstream"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("com.github.pedroSG94.RootEncoder:library:2.5.5")
+          }
+          EOF_3
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Screen Stream"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".StreamService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection|microphone" />
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'EOF_5'
+          <resources><string name="app_name">Screen Stream</string></resources>
+          EOF_5
+          mkdir -p $(dirname app/src/main/java/com/example/screenstream/StreamService.kt)
+          cat > app/src/main/java/com/example/screenstream/StreamService.kt <<'EOF_6'
+          package com.example.screenstream
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.media.AudioAttributes
+          import android.media.MediaMetadataRetriever
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.view.Surface
+          import com.pedro.common.ConnectChecker
+          import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRender
+          import com.pedro.encoder.input.gl.render.filters.`object`.SurfaceFilterRender
+          import com.pedro.encoder.utils.gl.TranslateTo
+          import com.pedro.library.rtmp.RtmpDisplay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import java.io.File
+
+          object StreamBus {
+              val live = MutableStateFlow(false)
+              val overlay = MutableStateFlow(false)
+              val status = MutableStateFlow("Готов")
+          }
+
+          class StreamService : Service() {
+
+              companion object {
+                  const val A_START = "start"
+                  const val A_STOP = "stop"
+                  const val A_SHOW = "show"
+                  const val A_HIDE = "hide"
+                  private const val CH = "stream"
+                  private val POSITIONS = listOf(
+                      TranslateTo.CENTER, TranslateTo.BOTTOM_RIGHT, TranslateTo.BOTTOM_LEFT,
+                      TranslateTo.TOP_RIGHT, TranslateTo.TOP_LEFT
+                  )
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private var display: RtmpDisplay? = null
+              private var player: MediaPlayer? = null
+              private var videoFilter: SurfaceFilterRender? = null
+              private var blackFilter: ImageObjectFilterRender? = null
+              private var frameW = 0
+              private var frameH = 0
+              private var outroUri: Uri? = null
+              private var recordFile: File? = null
+              private var finishing = false
+
+              private val checker = object : ConnectChecker {
+                  override fun onConnectionStarted(url: String) { StreamBus.status.value = "Подключение…" }
+                  override fun onConnectionSuccess() { StreamBus.status.value = "В эфире" }
+                  override fun onConnectionFailed(reason: String) {
+                      StreamBus.status.value = "Ошибка подключения: $reason"
+                      main.post { shutdown() }
+                  }
+                  override fun onNewBitrate(bitrate: Long) {}
+                  override fun onDisconnect() { StreamBus.status.value = "Отключено" }
+                  override fun onAuthError() { StreamBus.status.value = "Ошибка авторизации (ключ стрима)" }
+                  override fun onAuthSuccess() {}
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      A_START -> { startForegroundCompat(); start(intent) }
+                      A_STOP -> requestStop()
+                      A_SHOW -> {
+                          val uri = intent.getStringExtra("uri")?.let { Uri.parse(it) } ?: return START_NOT_STICKY
+                          val pct = intent.getFloatExtra("size", 40f)
+                          val pos = POSITIONS.getOrElse(intent.getIntExtra("pos", 0)) { TranslateTo.CENTER }
+                          val loop = intent.getBooleanExtra("loop", true)
+                          val full = pct >= 99.5f
+                          playVideo(uri, full, pct / 100f, pos, loop) { }
+                          StreamBus.overlay.value = true
+                      }
+                      A_HIDE -> { clearVideo(); StreamBus.overlay.value = false }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "Стрим", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, StreamService::class.java).setAction(A_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, CH)
+                      .setContentTitle("Screen Stream")
+                      .setContentText("Идёт запись экрана / стрим")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .addAction(Notification.Action.Builder(null, "Стоп", stop).build())
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(
+                          1, n,
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                      )
+                  } else startForeground(1, n)
+              }
+
+              private fun start(i: Intent) {
+                  if (display != null) return
+                  finishing = false
+                  val code = i.getIntExtra("code", 0)
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                      i.getParcelableExtra("data", Intent::class.java)
+                  else @Suppress("DEPRECATION") i.getParcelableExtra("data")
+                  val w = i.getIntExtra("w", 720)
+                  val h = i.getIntExtra("h", 1280)
+                  val dpi = i.getIntExtra("dpi", 320)
+                  val br = i.getIntExtra("br", 3_500_000)
+                  val url = i.getStringExtra("url").orEmpty()
+                  val rec = i.getBooleanExtra("rec", false)
+                  val sysAudio = i.getBooleanExtra("sysAudio", false)
+                  val intro = i.getStringExtra("intro")?.let { Uri.parse(it) }
+                  outroUri = i.getStringExtra("outro")?.let { Uri.parse(it) }
+                  frameW = w; frameH = h
+
+                  if (data == null) { fail("Нет разрешения на захват экрана"); return }
+                  try {
+                      val d = RtmpDisplay(applicationContext, true, checker)
+                      d.setIntentResult(code, data)
+                      val videoOk = d.prepareVideo(w, h, 30, br, 0, dpi)
+                      val audioOk = if (sysAudio && Build.VERSION.SDK_INT >= 29)
+                          d.prepareInternalAudio(128 * 1024, 44100, true, false, false)
+                      else d.prepareAudio(128 * 1024, 44100, true, true, true)
+                      if (!videoOk || !audioOk) { fail("Не удалось подготовить кодеки"); return }
+                      display = d
+                      if (url.isNotBlank()) { StreamBus.status.value = "Подключение…"; d.startStream(url) }
+                      if (rec) {
+                          val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+                          val f = File(dir, "screen_${System.currentTimeMillis()}.mp4")
+                          recordFile = f
+                          d.startRecord(f.absolutePath)
+                          if (url.isBlank()) StreamBus.status.value = "Идёт запись"
+                      }
+                      StreamBus.live.value = true
+                      if (intro != null) playVideo(intro, true, 1f, TranslateTo.CENTER, false) { }
+                  } catch (e: Exception) {
+                      fail("Ошибка запуска: ${e.message}")
+                  }
+              }
+
+              private fun fail(msg: String) {
+                  StreamBus.status.value = msg
+                  shutdown()
+              }
+
+              /** Показывает видео как слой в стриме. pct = доля кадра (0..1), видео вписывается с сохранением пропорций. */
+              private fun playVideo(uri: Uri, full: Boolean, pct: Float, pos: TranslateTo, loop: Boolean, onDone: () -> Unit) {
+                  val d = display ?: return
+                  clearVideo()
+                  var vw = 0; var vh = 0; var rot = 0
+                  try {
+                      val r = MediaMetadataRetriever()
+                      r.setDataSource(this, uri)
+                      vw = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                      vh = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                      rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                      r.release()
+                  } catch (_: Exception) { }
+                  if (rot == 90 || rot == 270) { val t = vw; vw = vh; vh = t }
+                  if (vw <= 0 || vh <= 0) { vw = 16; vh = 9 }
+                  val a = vw.toFloat() / vh
+                  val f = frameW.toFloat() / frameH
+                  val sx: Float; val sy: Float
+                  if (a >= f) { sx = pct * 100f; sy = pct * 100f * f / a } else { sy = pct * 100f; sx = pct * 100f * a / f }
+
+                  val mp = MediaPlayer()
+                  player = mp
+                  try {
+                      mp.setDataSource(this, uri)
+                  } catch (e: Exception) {
+                      StreamBus.status.value = "Не удалось открыть видео"
+                      clearVideo(); onDone(); return
+                  }
+                  mp.setAudioAttributes(
+                      AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build()
+                  )
+                  mp.isLooping = loop
+                  mp.setOnCompletionListener {
+                      if (!loop && player === mp) main.post { clearVideo(); StreamBus.overlay.value = false; onDone() }
+                  }
+                  mp.setOnErrorListener { _, _, _ ->
+                      main.post { clearVideo(); StreamBus.overlay.value = false; onDone() }
+                      true
+                  }
+                  mp.setOnPreparedListener {
+                      if (player !== mp || display == null) return@setOnPreparedListener
+                      if (full) {
+                          val bf = ImageObjectFilterRender()
+                          d.glInterface.addFilter(bf)
+                          bf.setImage(Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) })
+                          bf.setScale(100f, 100f)
+                          bf.setPosition(TranslateTo.CENTER)
+                          blackFilter = bf
+                      }
+                      val vf = SurfaceFilterRender { st ->
+                          try { mp.setSurface(Surface(st)); mp.start() } catch (_: Exception) { }
+                      }
+                      d.glInterface.addFilter(vf)
+                      vf.setScale(sx, sy)
+                      vf.setPosition(pos)
+                      videoFilter = vf
+                  }
+                  mp.prepareAsync()
+              }
+
+              private fun clearVideo() {
+                  try { player?.stop() } catch (_: Exception) { }
+                  try { player?.release() } catch (_: Exception) { }
+                  player = null
+                  val d = display
+                  try { videoFilter?.let { d?.glInterface?.removeFilter(it) } } catch (_: Exception) { }
+                  try { blackFilter?.let { d?.glInterface?.removeFilter(it) } } catch (_: Exception) { }
+                  videoFilter = null
+                  blackFilter = null
+              }
+
+              private fun requestStop() {
+                  val d = display
+                  if (d == null || finishing) { shutdown(); return }
+                  val outro = outroUri
+                  if (outro != null) {
+                      finishing = true
+                      StreamBus.status.value = "Концовка…"
+                      playVideo(outro, true, 1f, TranslateTo.CENTER, false) { shutdown() }
+                  } else shutdown()
+              }
+
+              private fun shutdown() {
+                  clearVideo()
+                  val d = display
+                  display = null
+                  try { if (d?.isRecording == true) d.stopRecord() } catch (_: Exception) { }
+                  try { if (d?.isStreaming == true) d.stopStream() } catch (_: Exception) { }
+                  saveRecordToGallery()
+                  StreamBus.live.value = false
+                  StreamBus.overlay.value = false
+                  if (!StreamBus.status.value.startsWith("Ошибка")) StreamBus.status.value = "Готов"
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              private fun saveRecordToGallery() {
+                  val f = recordFile ?: return
+                  recordFile = null
+                  if (Build.VERSION.SDK_INT < 29 || !f.exists() || f.length() == 0L) return
+                  try {
+                      val cv = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ScreenStream")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+                      contentResolver.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+                      f.delete()
+                      StreamBus.status.value = "Запись сохранена: Movies/ScreenStream"
+                  } catch (_: Exception) { }
+              }
+
+              override fun onDestroy() {
+                  if (display != null) shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF_6
+          mkdir -p $(dirname app/src/main/java/com/example/screenstream/MainActivity.kt)
+          cat > app/src/main/java/com/example/screenstream/MainActivity.kt <<'EOF_7'
+          package com.example.screenstream
+
+          import android.Manifest
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : ComponentActivity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(Modifier.fillMaxSize()) { Screen() }
+                      }
+                  }
+              }
+
+              private fun keep(u: Uri) {
+                  try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) { }
+              }
+
+              private fun name(u: Uri?): String = u?.lastPathSegment?.substringAfterLast('/') ?: "не выбрано"
+
+              @Composable
+              fun Screen() {
+                  val live by StreamBus.live.collectAsState()
+                  val overlayOn by StreamBus.overlay.collectAsState()
+                  val status by StreamBus.status.collectAsState()
+
+                  var url by remember { mutableStateOf("") }
+                  var p1080 by remember { mutableStateOf(false) }
+                  var sysAudio by remember { mutableStateOf(Build.VERSION.SDK_INT >= 29) }
+                  var record by remember { mutableStateOf(false) }
+                  var intro by remember { mutableStateOf<Uri?>(null) }
+                  var outro by remember { mutableStateOf<Uri?>(null) }
+                  var clip by remember { mutableStateOf<Uri?>(null) }
+                  var size by remember { mutableFloatStateOf(40f) }
+                  var pos by remember { mutableIntStateOf(0) }
+                  var loop by remember { mutableStateOf(true) }
+
+                  val pickIntro = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> u?.let { keep(it); intro = it } }
+                  val pickOutro = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> u?.let { keep(it); outro = it } }
+                  val pickClip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> u?.let { keep(it); clip = it } }
+
+                  val capture = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                      val data = r.data
+                      if (r.resultCode == RESULT_OK && data != null) {
+                          val dm = resources.displayMetrics
+                          val sw = dm.widthPixels
+                          val sh = dm.heightPixels
+                          val k = (if (p1080) 1080f else 720f) / minOf(sw, sh)
+                          val w = (sw * k).toInt() and 1.inv()
+                          val h = (sh * k).toInt() and 1.inv()
+                          val i = Intent(this, StreamService::class.java).setAction(StreamService.A_START)
+                              .putExtra("code", r.resultCode)
+                              .putExtra("data", data)
+                              .putExtra("w", w).putExtra("h", h).putExtra("dpi", dm.densityDpi)
+                              .putExtra("br", if (p1080) 6_000_000 else 3_500_000)
+                              .putExtra("url", url.trim())
+                              .putExtra("rec", record)
+                              .putExtra("sysAudio", sysAudio)
+                          intro?.let { i.putExtra("intro", it.toString()) }
+                          outro?.let { i.putExtra("outro", it.toString()) }
+                          ContextCompat.startForegroundService(this, i)
+                      }
+                  }
+
+                  val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+                      if (res[Manifest.permission.RECORD_AUDIO] == true) {
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          capture.launch(mpm.createScreenCaptureIntent())
+                      } else Toast.makeText(this, "Нужен доступ к микрофону/звуку", Toast.LENGTH_LONG).show()
+                  }
+
+                  Column(
+                      Modifier.fillMaxSize().verticalScroll(rememberScrollState()).statusBarsPadding().padding(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      Text("Screen Stream", style = MaterialTheme.typography.headlineMedium)
+                      Text("Статус: $status")
+
+                      OutlinedTextField(
+                          value = url, onValueChange = { url = it }, enabled = !live,
+                          label = { Text("RTMP-адрес + ключ (rtmp://.../ключ)") },
+                          modifier = Modifier.fillMaxWidth(), singleLine = true
+                      )
+
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("Качество:", Modifier.weight(1f))
+                          FilterChip(selected = !p1080, onClick = { if (!live) p1080 = false }, label = { Text("720p") })
+                          Spacer(Modifier.width(8.dp))
+                          FilterChip(selected = p1080, onClick = { if (!live) p1080 = true }, label = { Text("1080p") })
+                      }
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                              if (sysAudio) "Звук: система (игра + вставленное видео)" else "Звук: микрофон",
+                              Modifier.weight(1f)
+                          )
+                          Switch(checked = sysAudio, onCheckedChange = { if (!live) sysAudio = it && Build.VERSION.SDK_INT >= 29 })
+                      }
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("Записывать экран в файл", Modifier.weight(1f))
+                          Switch(checked = record, onCheckedChange = { if (!live) record = it })
+                      }
+
+                      HorizontalDivider()
+                      Text("Заставка и концовка", style = MaterialTheme.typography.titleMedium)
+                      FileRow("Заставка (перед стримом)", intro, { pickIntro.launch(arrayOf("video/*")) }, { intro = null }, !live)
+                      FileRow("Концовка (при остановке)", outro, { pickOutro.launch(arrayOf("video/*")) }, { outro = null }, !live)
+
+                      Button(
+                          onClick = {
+                              if (url.isBlank() && !record) {
+                                  Toast.makeText(this@MainActivity, "Укажи RTMP-адрес или включи запись", Toast.LENGTH_LONG).show()
+                              } else {
+                                  val p = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                                  if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
+                                  perms.launch(p.toTypedArray())
+                              }
+                          },
+                          enabled = !live, modifier = Modifier.fillMaxWidth()
+                      ) { Text(if (url.isBlank()) "Начать запись экрана" else "Начать стрим") }
+
+                      Button(
+                          onClick = { startService(Intent(this@MainActivity, StreamService::class.java).setAction(StreamService.A_STOP)) },
+                          enabled = live, modifier = Modifier.fillMaxWidth(),
+                          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                      ) { Text("Остановить (с концовкой, если выбрана)") }
+
+                      HorizontalDivider()
+                      Text("Вставка видео в стрим", style = MaterialTheme.typography.titleMedium)
+                      Text("Любое видео — вертикальное или горизонтальное, пропорции сохраняются.", style = MaterialTheme.typography.bodySmall)
+                      FileRow("Видео для вставки", clip, { pickClip.launch(arrayOf("video/*")) }, { clip = null }, true)
+
+                      Text("Размер: ${size.toInt()}% кадра (100% = на весь экран)")
+                      Slider(value = size, onValueChange = { size = it }, valueRange = 10f..100f)
+
+                      val posNames = listOf("Центр", "Справа внизу", "Слева внизу", "Справа вверху", "Слева вверху")
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.verticalScroll(rememberScrollState())) { }
+                      Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                          posNames.chunked(3).forEachIndexed { row, names ->
+                              Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                  names.forEachIndexed { idx, n ->
+                                      val id = row * 3 + idx
+                                      FilterChip(selected = pos == id, onClick = { pos = id }, label = { Text(n) })
+                                  }
+                              }
+                          }
+                      }
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("Повторять по кругу", Modifier.weight(1f))
+                          Switch(checked = loop, onCheckedChange = { loop = it })
+                      }
+
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(
+                              onClick = {
+                                  startService(
+                                      Intent(this@MainActivity, StreamService::class.java).setAction(StreamService.A_SHOW)
+                                          .putExtra("uri", clip.toString()).putExtra("size", size)
+                                          .putExtra("pos", pos).putExtra("loop", loop)
+                                  )
+                              },
+                              enabled = live && clip != null, modifier = Modifier.weight(1f)
+                          ) { Text(if (overlayOn) "Заменить" else "Показать в стриме") }
+                          OutlinedButton(
+                              onClick = { startService(Intent(this@MainActivity, StreamService::class.java).setAction(StreamService.A_HIDE)) },
+                              enabled = live && overlayOn, modifier = Modifier.weight(1f)
+                          ) { Text("Убрать") }
+                      }
+                      Spacer(Modifier.height(24.dp))
+                  }
+              }
+
+              @Composable
+              private fun FileRow(label: String, uri: Uri?, onPick: () -> Unit, onClear: () -> Unit, enabled: Boolean) {
+                  Column {
+                      Text(label, style = MaterialTheme.typography.bodyMedium)
+                      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedButton(onClick = onPick, enabled = enabled) { Text("Выбрать") }
+                          Text(name(uri), Modifier.weight(1f), maxLines = 1)
+                          if (uri != null && enabled) TextButton(onClick = onClear) { Text("Сброс") }
+                      }
+                  }
+              }
+          }
+          EOF_7
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+        working-directory: /tmp/proj
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenStream-debug-apk
+          path: /tmp/proj/app/build/outputs/apk/debug/*.apk
